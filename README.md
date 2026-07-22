@@ -1,4 +1,4 @@
-# vpn-deploy
+# WhiteLight
 
 Self-hosted OpenVPN + Telegram bot, with a WebRTC-based fallback tunnel (via
 [olcRTC](https://github.com/openlibrecommunity/olcrtc)) for when a provider
@@ -6,6 +6,9 @@ whitelists only "legitimate" video-call services (Jitsi/Telemost/WbStream) and
 blocks regular VPN protocols.
 
 Inspired by the write-up at https://www.pvsm.ru/vpn/449328.
+
+> Built with AI assistance (Claude Code / Anthropic's Claude) — code, bot
+> features, and this README were written collaboratively with an AI agent.
 
 ## What's here
 
