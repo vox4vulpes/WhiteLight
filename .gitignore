@@ -1,0 +1,6 @@
+.env
+openvpn-data/
+bot-data/
+olcrtc-image/olcrtc-linux-amd64
+__pycache__/
+*.pyc

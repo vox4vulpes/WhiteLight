@@ -1,0 +1,24 @@
+services:
+  vpn:
+    image: kylemanna/openvpn
+    container_name: ovpn-server
+    ports:
+      - "${OVPN_PORT:-1194}:1194/udp"
+    volumes:
+      - ./openvpn-data:/etc/openvpn
+    cap_add:
+      - NET_ADMIN
+    privileged: true
+    restart: always
+
+  bot:
+    build: .
+    container_name: vpn-bot
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./bot-data:/data
+    depends_on:
+      - vpn
+    restart: always

@@ -1,0 +1,1080 @@
+import telebot
+import subprocess
+import uuid
+import os
+import json
+import time
+import re
+import threading
+import concurrent.futures
+import ipaddress
+from datetime import datetime, timezone
+from io import BytesIO
+
+import qrcode
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+TOKEN = os.getenv('BOT_TOKEN')
+bot = telebot.TeleBot(TOKEN)
+
+ADMIN_TELEGRAM_ID = int(os.getenv('ADMIN_TELEGRAM_ID', '0'))
+
+VPN_CONTAINER_NAME = "ovpn-server"
+STATUS_LOG = "/tmp/openvpn-status.log"
+HISTORY_FILE = "/tmp/bandwidth_history.json"
+BW_LIMIT = 1_000_000_000  # 1 Gbps in bits/sec
+
+OLCRTC_IMAGE = "olcrtc-server:latest"
+OLCRTC_JITSI_INSTANCE = "meet.egovm.ru"  # проверено вручную, что открывается в белых списках
+JITSI_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}\.)+[a-zA-Z]{2,}$')
+
+JITSI_LIST_URL = "https://raw.githubusercontent.com/denpiligrim/jitsi-scanner/main/found_jitsi_domains.txt"
+JITSI_SCAN_TIMEOUT = 3      # сек на один хост (latency-скан)
+JITSI_SCAN_WORKERS = 8      # конкурентность, без фанатизма
+JITSI_SCAN_PROGRESS_MIN_INTERVAL = 2  # сек между обновлениями статуса в чате
+
+JITSI_SPEED_CONNECT_TIMEOUT = 3     # сек на установку соединения
+JITSI_SPEED_TARGET_BYTES = 20_000_000  # качаем хотя бы 20 МБ на хост для честного замера
+JITSI_SPEED_SAFETY_SECONDS = 30     # защитный потолок на хост, если он слишком медленный/зависает
+JITSI_SPEED_WORKERS = 8             # конкурентность для speed-скана, без фанатизма
+
+TELEGRAM_MSG_LIMIT = 3500  # запас от лимита телеграма в 4096 символов на сообщение
+
+KNOWN_WHITE_FLAGS = {"-best_ms", "-best_mb", "-best_all", "-test", "-default"}
+
+DATA_DIR = "/data"  # смонтирован как volume, переживает пересборку/рестарт бота
+CLIENT_NAMES_FILE = os.path.join(DATA_DIR, "client_names.json")   # {real_name: alias}
+WHITE_CONFIGS_FILE = os.path.join(DATA_DIR, "white_configs.json")  # {container_name: {...}}
+DEFAULT_JITSI_FILE = os.path.join(DATA_DIR, "default_jitsi.json")  # {"host": "..."}
+
+# message_id сообщения с конфигом -> real_name, для обработки ответа-переименования.
+# Живёт только в памяти процесса: если бот перезапустится до ответа - просто
+# отвалится возможность переименовать именно то сообщение, не критично.
+pending_rename = {}
+
+
+def is_admin(message):
+    return message.from_user.id == ADMIN_TELEGRAM_ID
+
+
+def load_json_file(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
+
+
+def save_json_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def get_client_names():
+    return load_json_file(CLIENT_NAMES_FILE, {})
+
+
+def set_client_name(real_name, alias):
+    names = get_client_names()
+    names[real_name] = alias
+    save_json_file(CLIENT_NAMES_FILE, names)
+
+
+def get_white_configs():
+    return load_json_file(WHITE_CONFIGS_FILE, {})
+
+
+def save_white_config(container_name, data):
+    configs = get_white_configs()
+    configs[container_name] = data
+    save_json_file(WHITE_CONFIGS_FILE, configs)
+
+
+def get_default_jitsi_instance():
+    return load_json_file(DEFAULT_JITSI_FILE, {}).get("host", OLCRTC_JITSI_INSTANCE)
+
+
+def set_default_jitsi_instance(host):
+    save_json_file(DEFAULT_JITSI_FILE, {"host": host})
+
+
+def sanitize_alias(text):
+    """Убирает символы, ломающие Markdown (бэктики/звёздочки/подчёркивания/скобки) и переносы строк."""
+    alias = re.sub(r'[`*_\[\]\n\r]', ' ', text)
+    alias = re.sub(r'\s+', ' ', alias).strip()
+    return alias[:40] if alias else "(без имени)"
+
+
+def sanitize_jitsi_host(raw):
+    """Возвращает (host, error). error is None если всё ок."""
+    host = raw.strip()
+    host = re.sub(r'^https?://', '', host)
+    host = host.split('/', 1)[0]  # отбросить путь, если вставили ссылку на комнату
+
+    if not JITSI_HOST_RE.match(host):
+        return None, f"⛔ Некорректный домен Jitsi-сервера: `{host}`"
+
+    return host, None
+
+
+def send_long_message(chat_id, text, parse_mode=None):
+    """Шлёт текст одним сообщением, а если он длиннее лимита телеграма - режет по строкам."""
+    lines = text.split("\n")
+    chunk = ""
+    for line in lines:
+        candidate = f"{chunk}\n{line}" if chunk else line
+        if len(candidate) > TELEGRAM_MSG_LIMIT:
+            if chunk:
+                bot.send_message(chat_id, chunk, parse_mode=parse_mode)
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        bot.send_message(chat_id, chunk, parse_mode=parse_mode)
+
+
+def is_bare_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def fetch_jitsi_candidates():
+    """Тянет список кандидатов, отбрасывая голые IP: реальный Jitsi-коннект идёт
+    через TLS с проверкой сертификата по hostname/SNI, а у сертификата нет IP SAN'ов,
+    поэтому такие хосты проходят HTTP-пробы, но никогда не работают как туннель."""
+    resp = requests.get(JITSI_LIST_URL, timeout=10)
+    resp.raise_for_status()
+    hosts = []
+    for line in resp.text.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and not is_bare_ip(line):
+            hosts.append(line)
+    return hosts
+
+
+def probe_jitsi_host(host):
+    start = time.monotonic()
+    try:
+        r = requests.get(f"https://{host}/", timeout=JITSI_SCAN_TIMEOUT, verify=False, allow_redirects=True)
+        elapsed = time.monotonic() - start
+        if r.status_code < 500:
+            return host, elapsed, None
+        return host, elapsed, f"HTTP {r.status_code}"
+    except Exception as e:
+        return host, time.monotonic() - start, str(e)
+
+
+def scan_best_jitsi(progress_cb, hosts=None):
+    """Пробегается по списку кандидатов, отчитывается через progress_cb(done, total, found).
+    Если hosts не передан, тянет список сам (для одиночного вызова -best_ms)."""
+    if hosts is None:
+        hosts = fetch_jitsi_candidates()
+    total = len(hosts)
+    results = []
+    done = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JITSI_SCAN_WORKERS) as pool:
+        futures = [pool.submit(probe_jitsi_host, h) for h in hosts]
+        for future in concurrent.futures.as_completed(futures):
+            host, elapsed, err = future.result()
+            done += 1
+            if err is None:
+                results.append((host, elapsed))
+            progress_cb(done, total, len(results))
+
+    results.sort(key=lambda x: x[1])
+    return results, total
+
+
+def probe_jitsi_speed(host):
+    """Качает данные с хоста повторными запросами (keep-alive) до JITSI_SPEED_TARGET_BYTES
+    или до защитного тайм-аута, если сервер слишком медленный/страница слишком маленькая.
+    Ошибка отдельной итерации (например таймаут ближе к границе SAFETY) останавливает цикл,
+    но не отбрасывает уже накопленные байты. Возвращает (host, mbps, error)."""
+    start = time.monotonic()
+    total_bytes = 0
+    first_attempt_error = None
+
+    session = requests.Session()
+    session.verify = False
+
+    while total_bytes < JITSI_SPEED_TARGET_BYTES:
+        elapsed = time.monotonic() - start
+        remaining = JITSI_SPEED_SAFETY_SECONDS - elapsed
+        if remaining <= 0:
+            break
+
+        try:
+            with session.get(
+                f"https://{host}/",
+                timeout=(JITSI_SPEED_CONNECT_TIMEOUT, remaining),
+                stream=True,
+            ) as r:
+                if r.status_code >= 500:
+                    if total_bytes == 0:
+                        return host, 0.0, f"HTTP {r.status_code}"
+                    break
+                got_any = False
+                for chunk in r.iter_content(chunk_size=65536):
+                    if not chunk:
+                        break
+                    got_any = True
+                    total_bytes += len(chunk)
+                    elapsed = time.monotonic() - start
+                    if elapsed >= JITSI_SPEED_SAFETY_SECONDS or total_bytes >= JITSI_SPEED_TARGET_BYTES:
+                        break
+                if not got_any:
+                    break  # пустой ответ, нет смысла зацикливаться дальше
+        except Exception as e:
+            if total_bytes == 0:
+                first_attempt_error = str(e)
+            break  # ошибка в конкретной итерации - используем то, что уже накопили
+
+    elapsed = time.monotonic() - start
+    if total_bytes == 0 or elapsed <= 0:
+        return host, 0.0, first_attempt_error or "нет данных"
+
+    mbps = (total_bytes * 8) / elapsed / 1_000_000
+    return host, mbps, None
+
+
+def scan_best_long_jitsi(progress_cb, hosts=None):
+    """Как scan_best_jitsi, но ранжирует по реальной скорости скачивания (Mbps, >=20МБ на хост), не по задержке.
+    Если hosts не передан, тянет список сам (для одиночного вызова -best_mb)."""
+    if hosts is None:
+        hosts = fetch_jitsi_candidates()
+    total = len(hosts)
+    results = []
+    done = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JITSI_SPEED_WORKERS) as pool:
+        futures = [pool.submit(probe_jitsi_speed, h) for h in hosts]
+        for future in concurrent.futures.as_completed(futures):
+            host, mbps, err = future.result()
+            done += 1
+            if err is None and mbps > 0:
+                results.append((host, mbps))
+            progress_cb(done, total, len(results))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results, total
+
+
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    bot.reply_to(
+        message,
+        "🔐 *VPN Бот*\n\n"
+        "Привет! Я помогу получить конфиг для подключения к VPN.\n\n"
+        "*/new* — сгенерировать новый профиль и получить `.ovpn` файл\n"
+        "*/white* `[jitsi-сервер]` — поднять запасной туннель через белые списки (Jitsi/WebRTC), для случаев когда обычный VPN режут\n"
+        f"  по умолчанию `{get_default_jitsi_instance()}`, можно указать свой: `/white meet.small-dm.ru`\n"
+        "*/white* `-best_ms` — просканировать публичный список Jitsi-серверов и поднять туннель на сервере с наименьшей задержкой\n"
+        "*/white* `-best_mb` — то же самое, но выбор по реальной скорости скачивания (Mbps, тест на 20+ МБ), а не по задержке — дольше, но точнее\n"
+        "*/white* `-best_all` — проводит оба теста и считает комбинированный балл по местам в каждом (1 место = -1 балл, N место = -N баллов, старт у всех N+1; место по скорости считается с двойным весом)\n"
+        "  добавь `-test` к любому из `-best_ms` / `-best_mb` / `-best_all` (например `/white -best_ms -test`), чтобы только увидеть результаты скана без подъёма туннеля\n"
+        "*/white* `-default <домен>` — задать домен по умолчанию для обычного `/white` (например `/white -default meet.small-dm.ru`)\n"
+        "*/monitor* — статистика клиентов и загрузка канала\n"
+        "*/list* — список всех клиентов: OpenVPN и White отдельно, внутри групп по убыванию трафика/активности\n"
+        "  пришли имя конфига из списка (например `user_cd89c7` или `olcrtc-68518b35`), чтобы получить его заново — ответь на это сообщение текстом, чтобы задать имя, видимое в /list\n"
+        "*/start* — показать это сообщение",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['new'])
+def handle_new_vpn(message):
+    # Генерируем случайное имя
+    client_name = f"user_{uuid.uuid4().hex[:6]}"
+    msg = bot.reply_to(message, f"⏳ Генерирую конфиг для `{client_name}`... Подождите немного.")
+
+    try:
+        # 1. Создаем сертификат (без пароля - 'nopass')
+        subprocess.run([
+            "docker", "exec", VPN_CONTAINER_NAME,
+            "easyrsa", "build-client-full", client_name, "nopass"
+        ], check=True)
+
+        # 2. Получаем готовый .ovpn файл
+        result = subprocess.run([
+            "docker", "exec", VPN_CONTAINER_NAME,
+            "ovpn_getclient", client_name
+        ], capture_output=True, text=True, check=True)
+
+        # 3. Сохраняем временно и отправляем
+        file_path = f"{client_name}.ovpn"
+        with open(file_path, "w") as f:
+            f.write(result.stdout)
+
+        with open(file_path, "rb") as f:
+            sent = bot.send_document(
+                message.chat.id,
+                f,
+                caption=(
+                    f"✅ Готово!\n👤 Профиль: `{client_name}`\n\n"
+                    "Ответь на это сообщение текстом, чтобы задать имя, видимое в /list."
+                )
+            )
+        pending_rename[sent.message_id] = client_name
+
+        # Удаляем временный файл
+        os.remove(file_path)
+        bot.delete_message(message.chat.id, msg.message_id)
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка при генерации: {str(e)}", message.chat.id, msg.message_id)
+
+
+def deploy_white_tunnel(chat_id, status_message_id, jitsi_instance):
+    try:
+        room_id = f"https://{jitsi_instance}/olcrtc-{uuid.uuid4().hex[:10]}"
+        enc_key = os.urandom(32).hex()
+        container_name = f"olcrtc-{uuid.uuid4().hex[:8]}"
+
+        subprocess.run([
+            "docker", "run", "-d",
+            "--name", container_name,
+            "--network", "host",
+            "--restart", "unless-stopped",
+            "-e", f"ROOM_ID={room_id}",
+            "-e", f"ENC_KEY={enc_key}",
+            "-e", "PROVIDER=jitsi",
+            "-e", "TRANSPORT=datachannel",
+            OLCRTC_IMAGE,
+        ], check=True, capture_output=True, text=True)
+
+        uri = f"olcrtc://jitsi?datachannel@{room_id}#{enc_key}${container_name}"
+
+        save_white_config(container_name, {
+            "jitsi_instance": jitsi_instance,
+            "room_id": room_id,
+            "enc_key": enc_key,
+            "uri": uri,
+            "created_at": time.time(),
+        })
+
+        qr_buf = BytesIO()
+        qrcode.make(uri).save(qr_buf, format="PNG")
+        qr_buf.seek(0)
+
+        sent = bot.send_photo(
+            chat_id,
+            qr_buf,
+            caption=(
+                "✅ Белый конфиг готов\n"
+                f"🌐 Jitsi: `{jitsi_instance}`\n"
+                f"🏷 Контейнер: `{container_name}`\n"
+                f"🚪 Комната: `{room_id}`\n\n"
+                "Импортируй QR в olcbox (Android) или используй строку:\n"
+                f"`{uri}`\n\n"
+                "Скачать olcbox: https://github.com/alananisimov/olcbox/releases/latest\n\n"
+                "Ответь на это сообщение текстом, чтобы задать имя, видимое в /list."
+            ),
+            parse_mode="Markdown"
+        )
+        pending_rename[sent.message_id] = container_name
+        bot.delete_message(chat_id, status_message_id)
+
+    except subprocess.CalledProcessError as e:
+        bot.edit_message_text(f"❌ Ошибка docker: {e.stderr}", chat_id, status_message_id)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка при генерации: {str(e)}", chat_id, status_message_id)
+
+
+@bot.message_handler(commands=['white'])
+def handle_white(message):
+    if not is_admin(message):
+        bot.reply_to(message, "⛔ Команда доступна только администратору.")
+        return
+
+    tokens = message.text.split()[1:]  # всё после /white, в любом порядке
+    flags = {t for t in tokens if t.startswith('-')}
+    non_flags = [t for t in tokens if not t.startswith('-')]
+
+    unknown = flags - KNOWN_WHITE_FLAGS
+    if unknown:
+        bot.reply_to(message, f"⛔ Неизвестный аргумент: {', '.join(sorted(unknown))}")
+        return
+
+    mode_flags = flags & {"-best_ms", "-best_mb", "-best_all", "-default"}
+    if len(mode_flags) > 1:
+        bot.reply_to(message, f"⛔ Нельзя указать одновременно {', '.join(sorted(mode_flags))}.")
+        return
+
+    dry_run = "-test" in flags
+
+    if "-best_ms" in flags:
+        handle_white_best(message, dry_run=dry_run)
+        return
+
+    if "-best_mb" in flags:
+        handle_white_best_long(message, dry_run=dry_run)
+        return
+
+    if "-best_all" in flags:
+        handle_white_best_all(message, dry_run=dry_run)
+        return
+
+    if "-default" in flags:
+        if not non_flags:
+            bot.reply_to(message, "⛔ Укажи домен: `/white -default meet.example.org`", parse_mode="Markdown")
+            return
+        host, error = sanitize_jitsi_host(non_flags[0])
+        if error:
+            bot.reply_to(message, error, parse_mode="Markdown")
+            return
+        set_default_jitsi_instance(host)
+        bot.reply_to(message, f"✅ Домен по умолчанию для `/white` теперь `{host}`", parse_mode="Markdown")
+        return
+
+    if dry_run:
+        bot.reply_to(message, "⛔ -test работает только вместе с -best_ms, -best_mb или -best_all.")
+        return
+
+    if non_flags:
+        jitsi_instance, error = sanitize_jitsi_host(non_flags[0])
+        if error:
+            bot.reply_to(message, error, parse_mode="Markdown")
+            return
+    else:
+        jitsi_instance = get_default_jitsi_instance()
+
+    msg = bot.reply_to(message, f"⏳ Поднимаю новый туннель через белые списки (Jitsi: {jitsi_instance})... Подождите немного.")
+    deploy_white_tunnel(message.chat.id, msg.message_id, jitsi_instance)
+
+
+def format_results_list(results, unit):
+    lines = []
+    for i, (host, value) in enumerate(results, start=1):
+        if unit == "ms":
+            lines.append(f"{i}. `{host}` — {value * 1000:.0f} мс")
+        else:
+            lines.append(f"{i}. `{host}` — {value:.1f} Mbps")
+    return "\n".join(lines)
+
+
+BEST_ALL_SPEED_WEIGHT = 2  # баллы за место в speed-тесте учитываются с этим множителем
+
+
+def compute_combined_scores(hosts, latency_results, speed_results):
+    """Балльная система: у каждого хоста изначально len(hosts)+1 баллов.
+    За каждый тест вычитается место хоста в этом тесте (1 место = -1 балл, N место = -N баллов),
+    место в speed-тесте умножается на BEST_ALL_SPEED_WEIGHT.
+    Хост, не ответивший в тесте, получает худшее возможное место (len(hosts)+1) в этом тесте.
+    Возвращает список (host, score, latency_rank, latency_sec, speed_rank, mbps),
+    отсортированный по score по убыванию (выше = лучше)."""
+    n = len(hosts)
+    worst_rank = n + 1
+    initial_score = worst_rank
+
+    latency_rank = {host: i for i, (host, _) in enumerate(latency_results, start=1)}
+    latency_value = dict(latency_results)
+    speed_rank = {host: i for i, (host, _) in enumerate(speed_results, start=1)}
+    speed_value = dict(speed_results)
+
+    combined = []
+    for host in hosts:
+        lr = latency_rank.get(host, worst_rank)
+        sr = speed_rank.get(host, worst_rank)
+        score = initial_score - lr - (BEST_ALL_SPEED_WEIGHT * sr)
+        combined.append((
+            host, score,
+            latency_rank.get(host), latency_value.get(host),
+            speed_rank.get(host), speed_value.get(host),
+        ))
+
+    combined.sort(key=lambda x: x[1], reverse=True)
+    return combined
+
+
+def format_combined_results_list(combined):
+    lines = []
+    for i, (host, score, lr, lv, sr, sv) in enumerate(combined, start=1):
+        ms_part = f"{lv * 1000:.0f} мс (#{lr})" if lr is not None else "нет ответа"
+        mbps_part = f"{sv:.1f} Mbps (#{sr})" if sr is not None else "нет ответа"
+        lines.append(f"{i}. `{host}` — счёт {score}: {ms_part} / {mbps_part}")
+    return "\n".join(lines)
+
+
+def handle_white_best(message, dry_run=False):
+    msg = bot.reply_to(message, "🔍 Получаю список Jitsi-серверов...")
+    last_edit = {"t": 0.0}
+
+    def progress_cb(done, total, found):
+        now = time.monotonic()
+        if done != total and now - last_edit["t"] < JITSI_SCAN_PROGRESS_MIN_INTERVAL:
+            return
+        last_edit["t"] = now
+        try:
+            bot.edit_message_text(
+                f"🔍 Сканирую Jitsi-серверы: {done}/{total} (осталось {total - done}), рабочих найдено: {found}",
+                message.chat.id, msg.message_id
+            )
+        except Exception:
+            pass  # skip flood-control edit errors, not critical
+
+    try:
+        results, total = scan_best_jitsi(progress_cb)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
+        return
+
+    if not results:
+        bot.edit_message_text(
+            f"❌ Просканировано {total} серверов, ни один не ответил из этой сети.",
+            message.chat.id, msg.message_id
+        )
+        return
+
+    best_host, best_latency = results[0]
+    bot.edit_message_text(
+        f"✅ Просканировано {total}, рабочих: {len(results)}\n"
+        f"🏆 Лучший: `{best_host}` ({best_latency * 1000:.0f} мс)\n\n"
+        + ("🧪 Режим -test: туннель не поднимается." if dry_run else "⏳ Поднимаю туннель на нём..."),
+        message.chat.id, msg.message_id, parse_mode="Markdown"
+    )
+
+    send_long_message(
+        message.chat.id,
+        "📋 *Полный список по задержке:*\n" + format_results_list(results, "ms"),
+        parse_mode="Markdown"
+    )
+
+    if not dry_run:
+        deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
+
+
+def handle_white_best_long(message, dry_run=False):
+    msg = bot.reply_to(message, "🚀 Получаю список Jitsi-серверов (тест на 20+ МБ на хост, может занять пару минут)...")
+    last_edit = {"t": 0.0}
+
+    def progress_cb(done, total, found):
+        now = time.monotonic()
+        if done != total and now - last_edit["t"] < JITSI_SCAN_PROGRESS_MIN_INTERVAL:
+            return
+        last_edit["t"] = now
+        try:
+            bot.edit_message_text(
+                f"🚀 Меряю скорость Jitsi-серверов: {done}/{total} (осталось {total - done}), рабочих найдено: {found}",
+                message.chat.id, msg.message_id
+            )
+        except Exception:
+            pass  # skip flood-control edit errors, not critical
+
+    try:
+        results, total = scan_best_long_jitsi(progress_cb)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
+        return
+
+    if not results:
+        bot.edit_message_text(
+            f"❌ Просканировано {total} серверов, ни один не отдал данные из этой сети.",
+            message.chat.id, msg.message_id
+        )
+        return
+
+    best_host, best_mbps = results[0]
+    bot.edit_message_text(
+        f"✅ Просканировано {total}, рабочих: {len(results)}\n"
+        f"🏆 Лучший: `{best_host}` ({best_mbps:.1f} Mbps)\n"
+        "_(скорость до веб-морды Jitsi, не гарантирует скорость видеомоста)_\n\n"
+        + ("🧪 Режим -test: туннель не поднимается." if dry_run else "⏳ Поднимаю туннель на нём..."),
+        message.chat.id, msg.message_id, parse_mode="Markdown"
+    )
+
+    send_long_message(
+        message.chat.id,
+        "📋 *Полный список по скорости:*\n" + format_results_list(results, "mbps"),
+        parse_mode="Markdown"
+    )
+
+    if not dry_run:
+        deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
+
+
+def handle_white_best_all(message, dry_run=False):
+    msg = bot.reply_to(message, "🧮 Получаю список Jitsi-серверов (оба теста, займёт пару минут)...")
+    last_edit = {"t": 0.0}
+
+    try:
+        hosts = fetch_jitsi_candidates()
+    except Exception as e:
+        bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
+        return
+
+    def make_progress_cb(stage_label):
+        def progress_cb(done, total, found):
+            now = time.monotonic()
+            if done != total and now - last_edit["t"] < JITSI_SCAN_PROGRESS_MIN_INTERVAL:
+                return
+            last_edit["t"] = now
+            try:
+                bot.edit_message_text(
+                    f"🧮 {stage_label}: {done}/{total} (осталось {total - done}), рабочих найдено: {found}",
+                    message.chat.id, msg.message_id
+                )
+            except Exception:
+                pass  # skip flood-control edit errors, not critical
+        return progress_cb
+
+    try:
+        latency_results, total = scan_best_jitsi(make_progress_cb("Этап 1/2, задержка"), hosts=hosts)
+        speed_results, _ = scan_best_long_jitsi(make_progress_cb("Этап 2/2, скорость"), hosts=hosts)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка во время сканирования: {e}", message.chat.id, msg.message_id)
+        return
+
+    if not latency_results and not speed_results:
+        bot.edit_message_text(
+            f"❌ Просканировано {total} серверов, ни один не ответил ни в одном из тестов.",
+            message.chat.id, msg.message_id
+        )
+        return
+
+    combined = compute_combined_scores(hosts, latency_results, speed_results)
+    best_host, best_score, best_lr, best_lv, best_sr, best_sv = combined[0]
+
+    ms_part = f"{best_lv * 1000:.0f} мс (#{best_lr})" if best_lr is not None else "нет ответа"
+    mbps_part = f"{best_sv:.1f} Mbps (#{best_sr})" if best_sr is not None else "нет ответа"
+
+    bot.edit_message_text(
+        f"✅ Просканировано {total}\n"
+        f"🏆 Лучший: `{best_host}` — счёт {best_score}\n"
+        f"   задержка: {ms_part}\n"
+        f"   скорость: {mbps_part}\n\n"
+        + ("🧪 Режим -test: туннель не поднимается." if dry_run else "⏳ Поднимаю туннель на нём..."),
+        message.chat.id, msg.message_id, parse_mode="Markdown"
+    )
+
+    send_long_message(
+        message.chat.id,
+        "📋 *Полный список (комбинированный балл):*\n" + format_combined_results_list(combined),
+        parse_mode="Markdown"
+    )
+
+    if not dry_run:
+        deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
+
+
+def parse_status():
+    result = subprocess.run(
+        ["docker", "exec", VPN_CONTAINER_NAME, "cat", STATUS_LOG],
+        capture_output=True, text=True
+    )
+    clients = []
+    in_clients = False
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Common Name"):
+            in_clients = True
+            continue
+        if line.startswith("ROUTING TABLE"):
+            in_clients = False
+            continue
+        if in_clients and line:
+            parts = line.split(",")
+            if len(parts) >= 4:
+                clients.append({
+                    "name": parts[0],
+                    "addr": parts[1],
+                    "bytes_recv": int(parts[2]),
+                    "bytes_sent": int(parts[3]),
+                    "since": parts[4]
+                })
+    return clients
+
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f)
+
+
+def format_bytes(b):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def format_bits_per_sec(bps):
+    for unit in ["bps", "Kbps", "Mbps", "Gbps"]:
+        if bps < 1000:
+            return f"{bps:.1f} {unit}"
+        bps /= 1000
+    return f"{bps:.1f} Tbps"
+
+
+def list_openvpn_clients():
+    """Все клиентские сертификаты, когда-либо выданные ботом (/new).
+    Сервер сам себе тоже выдаёт сертификат (CN=IP) - он не начинается с "user_",
+    поэтому исключается явно, а не через сверку с текущим OVPN_CN (после смены
+    сервера/IP это сравнение внутри ovpn_listclients больше не совпадает)."""
+    result = subprocess.run(
+        ["docker", "exec", VPN_CONTAINER_NAME, "ovpn_listclients"],
+        capture_output=True, text=True, check=True
+    )
+    clients = []
+    lines = result.stdout.strip().splitlines()
+    for line in lines[1:]:  # первая строка - заголовок CSV
+        parts = line.split(",")
+        if len(parts) < 4:
+            continue
+        name, status = parts[0], parts[3]
+        if not name.startswith("user_"):
+            continue
+        clients.append({"name": name, "status": status})
+    return clients
+
+
+def format_openvpn_list():
+    try:
+        certs = list_openvpn_clients()
+    except Exception as e:
+        return f"❌ Не удалось получить список OpenVPN-клиентов: {e}"
+
+    try:
+        connected = {c["name"]: c for c in parse_status()}
+    except Exception:
+        connected = {}
+
+    rows = []
+    for cert in certs:
+        name = cert["name"]
+        conn = connected.get(name)
+        if conn:
+            total = conn["bytes_recv"] + conn["bytes_sent"]
+            rows.append((name, True, total, conn["bytes_recv"], conn["bytes_sent"], cert["status"]))
+        else:
+            rows.append((name, False, 0, 0, 0, cert["status"]))
+
+    rows.sort(key=lambda r: r[2], reverse=True)
+
+    if not rows:
+        return "🔒 *OpenVPN* (0): клиентов нет."
+
+    names_map = get_client_names()
+    lines = [f"🔒 *OpenVPN* ({len(rows)}):"]
+    for i, (name, online, total, recv, sent, status) in enumerate(rows, start=1):
+        marker = "🟢" if online else "⚪"
+        status_note = "" if status == "VALID" else f" [{status}]"
+        alias = names_map.get(name)
+        label = f"{alias} (`{name}`)" if alias else f"`{name}`"
+        if online:
+            lines.append(f"{i}. {marker} {label}{status_note} — {format_bytes(total)} (↓{format_bytes(recv)} / ↑{format_bytes(sent)})")
+        else:
+            lines.append(f"{i}. {marker} {label}{status_note} — офлайн")
+    return "\n".join(lines)
+
+
+def format_uptime(seconds):
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м"
+    if m:
+        return f"{m}м"
+    return f"{s}с"
+
+
+def list_white_containers():
+    """Живые white-туннели (olcrtc-контейнеры). Работают с --network host,
+    поэтому у Docker нет отдельного сетевого трафика на контейнер - вместо этого
+    показываем CPU% (как индикатор активности) и аптайм."""
+    result = subprocess.run(
+        ["docker", "ps", "--filter", f"ancestor={OLCRTC_IMAGE}", "--format", "{{.Names}}"],
+        capture_output=True, text=True, check=True
+    )
+    names = [n for n in result.stdout.strip().splitlines() if n]
+    if not names:
+        return []
+
+    stats_result = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format", "{{.Name}},{{.CPUPerc}}"] + names,
+        capture_output=True, text=True, check=True
+    )
+    cpu_by_name = {}
+    for line in stats_result.stdout.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) == 2:
+            cpu_by_name[parts[0]] = parts[1].strip().rstrip('%')
+
+    rows = []
+    for name in names:
+        started_at = ""
+        try:
+            inspect_result = subprocess.run(
+                ["docker", "inspect", name, "--format", "{{.State.StartedAt}}"],
+                capture_output=True, text=True, check=True
+            )
+            started_at = inspect_result.stdout.strip()
+        except Exception:
+            pass
+
+        uptime_sec = None
+        try:
+            started_dt = datetime.strptime(started_at[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            uptime_sec = (datetime.now(timezone.utc) - started_dt).total_seconds()
+        except Exception:
+            pass
+
+        try:
+            cpu_val = float(cpu_by_name.get(name, "0"))
+        except ValueError:
+            cpu_val = 0.0
+
+        rows.append({"name": name, "cpu": cpu_val, "uptime_sec": uptime_sec})
+
+    rows.sort(key=lambda r: r["cpu"], reverse=True)
+    return rows
+
+
+def format_white_list():
+    try:
+        rows = list_white_containers()
+    except Exception as e:
+        return f"❌ Не удалось получить список White-туннелей: {e}"
+
+    if not rows:
+        return "🌐 *White/Jitsi* (0): туннелей нет."
+
+    names_map = get_client_names()
+    lines = [f"🌐 *White/Jitsi* ({len(rows)}):"]
+    for i, r in enumerate(rows, start=1):
+        alias = names_map.get(r['name'])
+        label = f"{alias} (`{r['name']}`)" if alias else f"`{r['name']}`"
+        lines.append(f"{i}. {label} — CPU {r['cpu']:.1f}%, аптайм {format_uptime(r['uptime_sec'])}")
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=['list'])
+def handle_list(message):
+    if not is_admin(message):
+        bot.reply_to(message, "⛔ Команда доступна только администратору.")
+        return
+
+    msg = bot.reply_to(message, "⏳ Собираю список клиентов...")
+
+    text = format_openvpn_list() + "\n\n" + format_white_list()
+
+    try:
+        bot.delete_message(message.chat.id, msg.message_id)
+    except Exception:
+        pass
+    send_long_message(message.chat.id, text, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['monitor'])
+def handle_monitor(message):
+    msg = bot.reply_to(message, "⏳ Собираю данные мониторинга...")
+
+    try:
+        clients = parse_status()
+        now = time.time()
+        total_recv = sum(c["bytes_recv"] for c in clients)
+        total_sent = sum(c["bytes_sent"] for c in clients)
+
+        history = load_history()
+        history.append({
+            "time": now,
+            "total_bytes": total_recv + total_sent
+        })
+        one_hour_ago = now - 3600
+        history = [h for h in history if h["time"] >= one_hour_ago]
+        save_history(history)
+
+        bw_text = "Нет данных за последний час (нужно два замера)"
+        pct_text = ""
+        if len(history) >= 2:
+            first = history[0]
+            last = history[-1]
+            elapsed = last["time"] - first["time"]
+            if elapsed > 0:
+                bits = (last["total_bytes"] - first["total_bytes"]) * 8
+                bps = bits / elapsed
+                bw_text = format_bits_per_sec(bps)
+                pct = (bps / BW_LIMIT) * 100
+                pct_text = f" ({pct:.1f}% от 1 Гбит/с)"
+
+        lines = [f"📊 *Мониторинг VPN*\n"]
+        lines.append(f"👥 *Клиенты:* {len(clients)}")
+        if clients:
+            lines.append("")
+            for c in clients:
+                total = format_bytes(c["bytes_recv"] + c["bytes_sent"])
+                lines.append(f"  └ `{c['name']}` — {total}")
+        lines.append("")
+        lines.append(f"📥 Принято: {format_bytes(total_recv)}")
+        lines.append(f"📤 Отправлено: {format_bytes(total_sent)}")
+        lines.append(f"📈 Средняя нагрузка за час: {bw_text}{pct_text}")
+
+        bot.edit_message_text("\n".join(lines), message.chat.id, msg.message_id, parse_mode="Markdown")
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка: {str(e)}", message.chat.id, msg.message_id)
+
+
+def take_snapshot():
+    try:
+        clients = parse_status()
+        now = time.time()
+        total = sum(c["bytes_recv"] + c["bytes_sent"] for c in clients)
+        history = load_history()
+        history.append({"time": now, "total_bytes": total})
+        cutoff = now - 3600
+        history = [h for h in history if h["time"] >= cutoff]
+        save_history(history)
+    except Exception:
+        pass
+
+
+def snapshot_loop():
+    while True:
+        take_snapshot()
+        time.sleep(300)
+
+
+def resolve_client_key(text):
+    """Ищет конфиг по реальному имени (user_xxx / olcrtc-xxx) или по алиасу, заданному через reply."""
+    names_map = get_client_names()
+    for real_name, alias in names_map.items():
+        if alias == text:
+            return real_name
+
+    if text.startswith("user_"):
+        try:
+            certs = list_openvpn_clients()
+        except Exception:
+            certs = []
+        if any(c["name"] == text for c in certs):
+            return text
+
+    if text.startswith("olcrtc-"):
+        if text in get_white_configs():
+            return text
+        try:
+            running = {r["name"] for r in list_white_containers()}
+        except Exception:
+            running = set()
+        if text in running:
+            return text
+
+    return None
+
+
+def send_config_info(chat_id, key):
+    names_map = get_client_names()
+    alias = names_map.get(key)
+    label = f"{alias} ({key})" if alias else key
+
+    if key.startswith("user_"):
+        try:
+            result = subprocess.run(
+                ["docker", "exec", VPN_CONTAINER_NAME, "ovpn_getclient", key],
+                capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as e:
+            bot.send_message(chat_id, f"❌ Не удалось получить конфиг: {e.stderr}")
+            return
+
+        file_path = f"{key}.ovpn"
+        with open(file_path, "w") as f:
+            f.write(result.stdout)
+        try:
+            with open(file_path, "rb") as f:
+                sent = bot.send_document(
+                    chat_id, f,
+                    caption=(
+                        f"📄 OpenVPN: {label}\n\n"
+                        "Ответь на это сообщение текстом, чтобы задать имя, видимое в /list."
+                    ),
+                )
+        finally:
+            os.remove(file_path)
+
+        pending_rename[sent.message_id] = key
+        return
+
+    if key.startswith("olcrtc-"):
+        cfg = get_white_configs().get(key)
+        if not cfg:
+            bot.send_message(
+                chat_id,
+                f"❌ Нет сохранённых данных для `{key}` (создан до обновления бота, конфиг утерян).",
+                parse_mode="Markdown"
+            )
+            return
+
+        uri = cfg["uri"]
+        qr_buf = BytesIO()
+        qrcode.make(uri).save(qr_buf, format="PNG")
+        qr_buf.seek(0)
+
+        sent = bot.send_photo(
+            chat_id, qr_buf,
+            caption=(
+                f"🌐 White: {label}\n"
+                f"Jitsi: `{cfg['jitsi_instance']}`\n"
+                f"Комната: `{cfg['room_id']}`\n\n"
+                f"`{uri}`\n\n"
+                "Ответь на это сообщение текстом, чтобы задать имя, видимое в /list."
+            ),
+            parse_mode="Markdown"
+        )
+        pending_rename[sent.message_id] = key
+        return
+
+
+@bot.message_handler(func=lambda m: bool(m.text) and not m.text.startswith('/'))
+def handle_text(message):
+    if not is_admin(message):
+        return  # молча игнорируем, не спамим не-админам в личке с ботом
+
+    try:
+        text = message.text.strip()
+
+        if message.reply_to_message and message.reply_to_message.message_id in pending_rename:
+            key = pending_rename.pop(message.reply_to_message.message_id)
+            alias = sanitize_alias(text)
+            set_client_name(key, alias)
+            bot.reply_to(message, f"✅ Имя для `{key}` обновлено: {alias}", parse_mode="Markdown")
+            return
+
+        key = resolve_client_key(text)
+        if key is None:
+            return  # не похоже на имя конфига - молчим, не мусорим в чат
+
+        send_config_info(message.chat.id, key)
+    except Exception as e:
+        # не даём необработанному исключению уронить весь polling-луп бота
+        try:
+            bot.reply_to(message, f"❌ Ошибка: {e}")
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    take_snapshot()
+    t = threading.Thread(target=snapshot_loop, daemon=True)
+    t.start()
+    print("Бот запущен...")
+    bot.infinity_polling()
