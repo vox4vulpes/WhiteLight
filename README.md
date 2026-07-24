@@ -1,4 +1,4 @@
-# WhiteLight
+# WhiteLite
 
 Self-hosted OpenVPN + Telegram bot, with a WebRTC-based fallback tunnel (via
 [olcRTC](https://github.com/openlibrecommunity/olcrtc)) for when a provider
